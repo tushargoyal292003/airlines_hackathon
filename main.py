@@ -8,8 +8,16 @@ Usage:
   python main.py --mode train         # Step 2: Train TFT-DCP model
   python main.py --mode evaluate      # Step 3: Evaluate + score pairs
   python main.py --mode baselines     # Step 4: Run baseline comparisons
+
+Directory layout (matches DataConfig defaults):
+  data/raw/bts/       ← On_Time_*.csv  (BTS on-time performance)
+  data/raw/noaa/      ← {AIRPORT}_{StationID}_{Year}.csv  (NOAA LCD)
+  data/raw/aspm/      ← {Year}-A.xls, {Year}-D.xls  (FAA ASPM)
+  data/processed/     ← written by preprocess step, read by train/evaluate
+  results/            ← written by evaluate/baselines steps
 """
 import argparse
+import json
 import torch
 import torch.multiprocessing as mp
 import pandas as pd
@@ -25,8 +33,22 @@ from train import train_distributed, train_single_gpu, Trainer
 from risk_scorer import PairRiskScorer
 
 
-PROCESSED_DIR = Path("./data/processed")
-RESULTS_DIR = Path("./results")
+# ══════════════════════════════════════════════════════════════
+# PATH HELPERS  — every file path goes through config, never hardcoded
+# ══════════════════════════════════════════════════════════════
+
+def processed_dir(config: Config) -> Path:
+    """Directory where preprocessor writes and train/evaluate reads from."""
+    p = Path(config.data.processed_dir)
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def results_dir(config: Config) -> Path:
+    """Directory where evaluate/baselines write outputs."""
+    p = Path(config.data.results_dir)
+    p.mkdir(parents=True, exist_ok=True)
+    return p
 
 
 # ══════════════════════════════════════════════════════════════
@@ -40,13 +62,13 @@ def preprocess(config: Config):
     print("=" * 70)
 
     pipeline = DataPipeline(config.data)
-    df = pipeline.run(save=True)
+    df = pipeline.run(save=True)          # saves processed_flights.parquet
+                                          # to config.data.processed_dir
 
     feature_groups = get_feature_groups(df)
     print("\n--- Feature Summary ---")
     for group, cols in feature_groups.items():
         print(f"  {group} ({len(cols)}): {cols}")
-
     print(f"\n  Total records: {len(df):,}")
     print(f"  Flight chains: {df['chain_id'].nunique():,}")
     if "DepDelay" in df.columns:
@@ -63,9 +85,9 @@ def preprocess(config: Config):
     proxy_df = proxy_eng.run(df)
 
     if len(proxy_df) > 0:
-        PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
-        proxy_df.to_parquet(PROCESSED_DIR / "proxy_sequences.parquet", index=False)
-        print(f"\n  Saved {len(proxy_df):,} proxy sequences")
+        proxy_path = processed_dir(config) / "proxy_sequences.parquet"
+        proxy_df.to_parquet(proxy_path, index=False)
+        print(f"\n  Saved {len(proxy_df):,} proxy sequences → {proxy_path}")
 
     return df, proxy_df
 
@@ -91,23 +113,32 @@ def _resolve_feature_cols(df: pd.DataFrame):
 
 
 def train_model(config: Config, df: pd.DataFrame = None):
-    """Train the TFT-DCP model."""
+    """Train the TFT-DCP model.
+
+    If df is None (i.e. called with --mode train), loads from the parquet
+    written by the preprocess step.  Path comes from config.data.processed_dir
+    so it always stays in sync.
+    """
     print("\n" + "=" * 70)
     print("PHASE 2: MODEL TRAINING")
     print("=" * 70)
 
+    pdir = processed_dir(config)
+
     if df is None:
-        data_path = PROCESSED_DIR / "processed_flights.parquet"
+        data_path = pdir / "processed_flights.parquet"
         if not data_path.exists():
             raise FileNotFoundError(
-                f"No processed data at {data_path}. "
-                "Run: python main.py --mode preprocess "
-                "--bts-dir ./data/data_bts/raw/bts "
-                "--noaa-dir ./data/data_noaa/raw/noaa "
-                "--aspm-dir ./data/data_aspm"
+                f"No processed data found at:\n"
+                f"  {data_path}\n\n"
+                f"Run the preprocess step first:\n"
+                f"  python main.py --mode preprocess \\\n"
+                f"    --bts-dir  {config.data.bts_data_dir} \\\n"
+                f"    --noaa-dir {config.data.noaa_data_dir} \\\n"
+                f"    --aspm-dir {config.data.aspm_data_dir}"
             )
         df = pd.read_parquet(data_path)
-        print(f"  Loaded {len(df):,} records")
+        print(f"  Loaded {len(df):,} records from {data_path}")
 
     static_cols, dynamic_cols, weather_cols = _resolve_feature_cols(df)
 
@@ -123,7 +154,6 @@ def train_model(config: Config, df: pd.DataFrame = None):
     df["Month"] = pd.to_numeric(df["Month"], errors="coerce")
     train_df = df[df["Month"].isin(config.data.train_months)]
     val_df = df[df["Month"].isin(config.data.val_months)]
-
     print(f"\n  Train: {len(train_df):,} rows | Val: {len(val_df):,} rows")
 
     ds_kwargs = dict(
@@ -149,10 +179,10 @@ def train_model(config: Config, df: pd.DataFrame = None):
             join=True,
         )
     else:
-        trainer = train_single_gpu(config, train_dataset, val_dataset)
+        train_single_gpu(config, train_dataset, val_dataset)
 
-    # Save feature column lists for evaluation phase
-    import json
+    # Save feature column metadata so evaluate() can reconstruct the model
+    # without needing the df in memory
     meta = {
         "static_cols": static_cols,
         "dynamic_cols": dynamic_cols,
@@ -160,10 +190,10 @@ def train_model(config: Config, df: pd.DataFrame = None):
         "num_dynamic": config.model.num_dynamic_features,
         "num_static": config.model.num_static_features,
     }
-    PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
-    with open(PROCESSED_DIR / "feature_meta.json", "w") as f:
+    meta_path = pdir / "feature_meta.json"
+    with open(meta_path, "w") as f:
         json.dump(meta, f, indent=2)
-    print(f"  Saved feature metadata to {PROCESSED_DIR / 'feature_meta.json'}")
+    print(f"  Saved feature metadata → {meta_path}")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -172,46 +202,55 @@ def train_model(config: Config, df: pd.DataFrame = None):
 
 def evaluate(config: Config, df: pd.DataFrame = None, proxy_df: pd.DataFrame = None):
     """Evaluate model and generate airport pair risk scores."""
-    import json
-
     print("\n" + "=" * 70)
     print("PHASE 3: EVALUATION & RISK SCORING")
     print("=" * 70)
 
-    # Load data
-    if df is None:
-        data_path = PROCESSED_DIR / "processed_flights.parquet"
-        df = pd.read_parquet(data_path)
-        print(f"  Loaded {len(df):,} flight records")
+    pdir = processed_dir(config)
+    rdir = results_dir(config)
 
+    # ── Load flight data ──────────────────────────────────────────────────
+    if df is None:
+        data_path = pdir / "processed_flights.parquet"
+        if not data_path.exists():
+            raise FileNotFoundError(
+                f"No processed data at {data_path}. Run preprocess first."
+            )
+        df = pd.read_parquet(data_path)
+        print(f"  Loaded {len(df):,} flight records from {data_path}")
+
+    # ── Load proxy sequences ──────────────────────────────────────────────
     if proxy_df is None:
-        proxy_path = PROCESSED_DIR / "proxy_sequences.parquet"
+        proxy_path = pdir / "proxy_sequences.parquet"
         if proxy_path.exists():
             proxy_df = pd.read_parquet(proxy_path)
-            print(f"  Loaded {len(proxy_df):,} proxy sequences")
+            print(f"  Loaded {len(proxy_df):,} proxy sequences from {proxy_path}")
         else:
-            print("  No proxy data found — scoring without regulatory flags")
+            print("  No proxy sequences found — scoring without regulatory flags")
             proxy_df = pd.DataFrame()
 
-    # Load feature metadata
-    meta_path = PROCESSED_DIR / "feature_meta.json"
+    # ── Load feature metadata ─────────────────────────────────────────────
+    meta_path = pdir / "feature_meta.json"
     if meta_path.exists():
         with open(meta_path) as f:
             meta = json.load(f)
-        static_cols = meta["static_cols"]
+        static_cols  = meta["static_cols"]
         dynamic_cols = meta["dynamic_cols"]
         weather_cols = meta["weather_cols"]
-        num_dynamic = meta["num_dynamic"]
-        num_static = meta["num_static"]
+        num_dynamic  = meta["num_dynamic"]
+        num_static   = meta["num_static"]
     else:
         static_cols, dynamic_cols, weather_cols = _resolve_feature_cols(df)
         num_dynamic = len(dynamic_cols) + len(weather_cols)
-        num_static = len(static_cols)
+        num_static  = len(static_cols)
 
-    # Load best model
+    # ── Load best checkpoint ──────────────────────────────────────────────
     ckpt_path = Path(config.train.checkpoint_dir) / "best_model.pt"
     if not ckpt_path.exists():
-        raise FileNotFoundError(f"No checkpoint at {ckpt_path}. Train first.")
+        raise FileNotFoundError(
+            f"No checkpoint at {ckpt_path}. Run train first:\n"
+            f"  python main.py --mode train"
+        )
 
     checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     model = TFTDCP(
@@ -230,32 +269,36 @@ def evaluate(config: Config, df: pd.DataFrame = None, proxy_df: pd.DataFrame = N
     model.load_state_dict(checkpoint["model_state_dict"])
     print(f"  Loaded model from epoch {checkpoint['epoch']}")
 
-    # Learned beta
     beta = torch.nn.functional.softplus(model.delay_propagation.beta).item()
     print(f"  Learned β: {beta:.4f} (paper range: 0.73–0.89)")
 
-    # Build test dataset
+    # ── Build test dataset & score ────────────────────────────────────────
+    from torch.utils.data import DataLoader
     test_dataset = FlightChainDataset(
-        df, static_cols=static_cols, dynamic_cols=dynamic_cols,
-        weather_cols=weather_cols, seq_len=config.model.sequence_length,
+        df,
+        static_cols=static_cols,
+        dynamic_cols=dynamic_cols,
+        weather_cols=weather_cols,
+        seq_len=config.model.sequence_length,
         hub=config.data.hub_airport,
     )
-    from torch.utils.data import DataLoader
     test_loader = DataLoader(
-        test_dataset, batch_size=config.train.batch_size,
-        shuffle=False, num_workers=4, pin_memory=True,
+        test_dataset,
+        batch_size=config.train.batch_size,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True,
         collate_fn=flight_collate_fn,
     )
 
-    # Score flights
     device = "cuda" if torch.cuda.is_available() else "cpu"
     scorer = PairRiskScorer(model, device=device)
     flight_preds = scorer.score_from_dataloader(test_loader)
 
-    # Compute per-flight metrics (MAE, RMSE, R²)
+    # ── Metrics ───────────────────────────────────────────────────────────
     y_true = flight_preds["actual_delay"].values
     y_pred = flight_preds["pred_delay"].values
-    mae = np.mean(np.abs(y_true - y_pred))
+    mae  = np.mean(np.abs(y_true - y_pred))
     rmse = np.sqrt(np.mean((y_true - y_pred) ** 2))
     ss_res = np.sum((y_true - y_pred) ** 2)
     ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
@@ -266,27 +309,30 @@ def evaluate(config: Config, df: pd.DataFrame = None, proxy_df: pd.DataFrame = N
     print(f"  RMSE: {rmse:.2f} min")
     print(f"  R²:   {r2:.4f}")
 
-    # Aggregate to pair risk scores + apply proxy constraints
+    # ── Aggregate pair risks + export ─────────────────────────────────────
     pair_risks = scorer.aggregate_pair_risks(
-        flight_preds, hub=config.data.hub_airport, proxy_df=proxy_df,
+        flight_preds,
+        hub=config.data.hub_airport,
+        proxy_df=proxy_df,
     )
+    scorer.export(pair_risks, output_dir=str(rdir))
 
-    # Export (Architecture Layer 4 output contract)
-    RESULTS_DIR.mkdir(exist_ok=True)
-    scorer.export(pair_risks, output_dir=str(RESULTS_DIR))
+    flight_preds.to_csv(rdir / "flight_predictions.csv", index=False)
 
-    # Save flight-level predictions for visualization
-    flight_preds.to_csv(RESULTS_DIR / "flight_predictions.csv", index=False)
-
-    # Save metrics summary
-    metrics = {"MAE": round(mae, 2), "RMSE": round(rmse, 2), "R2": round(r2, 4), "beta": round(beta, 4)}
-    with open(RESULTS_DIR / "metrics.json", "w") as f:
+    metrics = {
+        "MAE": round(mae, 2),
+        "RMSE": round(rmse, 2),
+        "R2": round(r2, 4),
+        "beta": round(beta, 4),
+    }
+    with open(rdir / "metrics.json", "w") as f:
         json.dump(metrics, f, indent=2)
-    print(f"\n  All results saved to {RESULTS_DIR}/")
+
+    print(f"\n  All results saved to {rdir}/")
 
 
 # ══════════════════════════════════════════════════════════════
-# PHASE 4: BASELINES (for report)
+# PHASE 4: BASELINES
 # ══════════════════════════════════════════════════════════════
 
 def run_baselines(config: Config, df: pd.DataFrame = None):
@@ -295,44 +341,48 @@ def run_baselines(config: Config, df: pd.DataFrame = None):
     print("PHASE 4: BASELINE COMPARISON")
     print("=" * 70)
 
+    pdir = processed_dir(config)
+    rdir = results_dir(config)
+
     if df is None:
-        data_path = PROCESSED_DIR / "processed_flights.parquet"
+        data_path = pdir / "processed_flights.parquet"
+        if not data_path.exists():
+            raise FileNotFoundError(
+                f"No processed data at {data_path}. Run preprocess first."
+            )
         df = pd.read_parquet(data_path)
 
     static_cols, dynamic_cols, weather_cols = _resolve_feature_cols(df)
     num_dynamic = len(dynamic_cols) + len(weather_cols)
-    num_static = len(static_cols)
+    num_static  = len(static_cols)
 
-    # Build datasets
     df["Month"] = pd.to_numeric(df["Month"], errors="coerce")
     train_df = df[df["Month"].isin(config.data.train_months)]
-    test_df = df[df["Month"].isin(config.data.val_months)]
+    test_df  = df[df["Month"].isin(config.data.val_months)]
 
     ds_kwargs = dict(
-        static_cols=static_cols, dynamic_cols=dynamic_cols,
-        weather_cols=weather_cols, seq_len=config.model.sequence_length,
+        static_cols=static_cols,
+        dynamic_cols=dynamic_cols,
+        weather_cols=weather_cols,
+        seq_len=config.model.sequence_length,
         hub=config.data.hub_airport,
     )
 
-    train_ds = FlightChainDataset(train_df, **ds_kwargs)
-    test_ds = FlightChainDataset(test_df, **ds_kwargs)
-
     from torch.utils.data import DataLoader
-    train_loader = DataLoader(train_ds, batch_size=config.train.batch_size,
-                              shuffle=True, num_workers=4, collate_fn=flight_collate_fn)
-    test_loader = DataLoader(test_ds, batch_size=config.train.batch_size,
-                             shuffle=False, num_workers=4, collate_fn=flight_collate_fn)
+    train_ds = FlightChainDataset(train_df, **ds_kwargs)
+    test_ds  = FlightChainDataset(test_df,  **ds_kwargs)
 
-    # All tabular features for GBM baselines
+    train_loader = DataLoader(train_ds, batch_size=config.train.batch_size,
+                              shuffle=True,  num_workers=4, collate_fn=flight_collate_fn)
+    test_loader  = DataLoader(test_ds,  batch_size=config.train.batch_size,
+                              shuffle=False, num_workers=4, collate_fn=flight_collate_fn)
+
     all_feature_cols = static_cols + dynamic_cols + weather_cols
     all_feature_cols = [c for c in all_feature_cols if c in df.columns]
 
     from experiments import run_benchmark_comparison, run_ablation_study
 
-    RESULTS_DIR.mkdir(exist_ok=True)
-
-    # Benchmark comparison (Table 2)
-    benchmark_results = run_benchmark_comparison(
+    run_benchmark_comparison(
         train_loader=train_loader,
         val_loader=test_loader,
         test_loader=test_loader,
@@ -344,8 +394,7 @@ def run_baselines(config: Config, df: pd.DataFrame = None):
         config=config,
     )
 
-    # Ablation study (Table 4)
-    ablation_results = run_ablation_study(
+    run_ablation_study(
         train_loader=train_loader,
         test_loader=test_loader,
         num_dynamic=num_dynamic,
@@ -353,7 +402,6 @@ def run_baselines(config: Config, df: pd.DataFrame = None):
         config=config,
     )
 
-    # Generate figures
     from visualize import generate_all_figures
     generate_all_figures()
 
@@ -364,15 +412,20 @@ def run_baselines(config: Config, df: pd.DataFrame = None):
 
 def main():
     parser = argparse.ArgumentParser(description="TFT-DCP Flight Delay Prediction")
-    parser.add_argument("--mode", choices=["preprocess", "train", "evaluate", "baselines", "all"],
-                        default="all")
-    parser.add_argument("--bts-dir", type=str, default="./data/data_bts/raw/bts")
-    parser.add_argument("--noaa-dir", type=str, default="./data/data_noaa/raw/noaa")
-    parser.add_argument("--aspm-dir", type=str, default="./data/data_aspm")
-    parser.add_argument("--hub", type=str, default="DFW")
-    parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--batch-size", type=int, default=128)
-    parser.add_argument("--lr", type=float, default=0.001)
+    parser.add_argument(
+        "--mode",
+        choices=["preprocess", "train", "evaluate", "baselines", "all"],
+        default="all",
+    )
+    parser.add_argument("--bts-dir",  type=str, default="./data/raw/bts")
+    parser.add_argument("--noaa-dir", type=str, default="./data/raw/noaa")
+    parser.add_argument("--aspm-dir", type=str, default="./data/raw/aspm")
+    parser.add_argument("--processed-dir", type=str, default="./data/processed")
+    parser.add_argument("--results-dir",   type=str, default="./results")
+    parser.add_argument("--hub",       type=str,  default="DFW")
+    parser.add_argument("--epochs",    type=int,  default=100)
+    parser.add_argument("--batch-size",type=int,  default=128)
+    parser.add_argument("--lr",        type=float, default=0.001)
     args = parser.parse_args()
 
     config = Config(
@@ -380,6 +433,8 @@ def main():
             bts_data_dir=args.bts_dir,
             noaa_data_dir=args.noaa_dir,
             aspm_data_dir=args.aspm_dir,
+            processed_dir=args.processed_dir,
+            results_dir=args.results_dir,
             hub_airport=args.hub,
         ),
         model=ModelConfig(),
@@ -397,10 +452,10 @@ def main():
         df, proxy_df = preprocess(config)
 
     if args.mode in ("train", "all"):
-        train_model(config, df)
+        train_model(config, df)          # df=None when --mode train → loads from disk
 
     if args.mode in ("evaluate", "all"):
-        evaluate(config, df, proxy_df)
+        evaluate(config, df, proxy_df)   # df=None when --mode evaluate → loads from disk
 
     if args.mode in ("baselines", "all"):
         run_baselines(config, df)
