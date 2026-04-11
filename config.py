@@ -2,6 +2,12 @@
 TFT-DCP Configuration
 Hyperparameters follow the paper: lr=0.001, dropout=0.1, hidden=128, batch=256, seq_len=14
 Adapted for DFW airport pair risk scoring problem.
+
+Data directory layout expected:
+  data/raw/bts/     ← On_Time_*.csv files from BTS
+  data/raw/noaa/    ← {AIRPORT}_{StationID}_{Year}.csv files from NOAA LCD
+  data/raw/aspm/    ← {Year}-A.xls and {Year}-D.xls files from FAA ASPM
+  data/processed/   ← written by preprocessor
 """
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -10,22 +16,27 @@ from typing import List
 
 @dataclass
 class DataConfig:
-    bts_data_dir: str = "./data/data_bts/raw/bts"
-    noaa_data_dir: str = "./data/data_noaa/raw/noaa"
-    aspm_data_dir: str = "./data/data_aspm"
+    # ── Data source directories ──────────────────────────────────────────────
+    # Update these to match your actual layout, or pass via CLI args in main.py:
+    #   python main.py --bts-dir ./data/raw/bts --noaa-dir ./data/raw/noaa \
+    #                  --aspm-dir ./data/raw/aspm
+    bts_data_dir: str = "./data/raw/bts"
+    noaa_data_dir: str = "./data/raw/noaa"
+    aspm_data_dir: str = "./data/raw/aspm"
     processed_dir: str = "./data/processed"
+    results_dir:   str = "./results"
+
     hub_airport: str = "DFW"
 
     # Extreme delay threshold (minutes) per paper Section 3.1.2
     extreme_delay_threshold: int = 180
 
-    # Train/val/test split
+    # Train/val/test split (months)
     train_months: List[int] = field(default_factory=lambda: list(range(1, 11)))  # Jan-Oct
-    val_months: List[int] = field(default_factory=lambda: [11, 12])  # Nov-Dec
-    # Test: extreme weather periods (paper Section 4.2.2)
+    val_months: List[int] = field(default_factory=lambda: [11, 12])             # Nov-Dec
 
     # Normalization
-    normalization: str = "minmax"  # minmax as per paper
+    normalization: str = "minmax"
 
 
 @dataclass
@@ -44,17 +55,17 @@ class ModelConfig:
 
     # Historical retrieval
     top_k_retrieval: int = 5
-    retrieval_alpha: float = 0.5  # fusion coefficient (Eq. 15)
+    retrieval_alpha: float = 0.5
     history_db_size: int = 50000
 
     # MS-CA-EFM (Section 3.2.3)
-    channel_reduction_ratio: int = 4  # reduction ratio r
+    channel_reduction_ratio: int = 4
 
     # Delay propagation (Section 3.2.4)
-    beta_init: float = 1.0  # initial decay coefficient
+    beta_init: float = 1.0
     max_chain_length: int = 6
 
-    # Feature dimensions (will be set dynamically)
+    # Feature dimensions (set dynamically during training)
     num_static_features: int = 8
     num_dynamic_features: int = 22
     num_weather_features: int = 12
@@ -69,11 +80,11 @@ class TrainConfig:
     early_stopping_patience: int = 10
     weight_decay: float = 1e-5
 
-    # Multi-GPU (4x A6000)
+    # Multi-GPU
     num_gpus: int = 4
     distributed: bool = True
 
-    # DataLoader memory/perf controls
+    # DataLoader
     num_workers: int = 2
     pin_memory: bool = True
     prefetch_factor: int = 2
