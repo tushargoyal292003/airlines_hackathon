@@ -114,6 +114,17 @@ class AblationVariant3(nn.Module):
         return {"prediction": self.head(h_fused).squeeze(-1), "h_current": h_current}
 
 
+def save_checkpoint(model, metrics, name, ckpt_dir="checkpoints/baselines"):
+    """Save model checkpoint and metrics to disk."""
+    import json
+    Path(ckpt_dir).mkdir(parents=True, exist_ok=True)
+    torch.save(model.state_dict(), f"{ckpt_dir}/{name}.pt")
+    with open(f"{ckpt_dir}/{name}_metrics.json", "w") as f:
+        json.dump(metrics, f, indent=2)
+    print(f"  Saved checkpoint → {ckpt_dir}/{name}.pt")
+    print(f"  Saved metrics    → {ckpt_dir}/{name}_metrics.json")
+
+
 def run_benchmark_comparison(
     train_loader: DataLoader,
     val_loader: DataLoader,
@@ -128,8 +139,11 @@ def run_benchmark_comparison(
     """
     Run all baselines and TFT-DCP, return Table 2 results.
     """
+    import json, joblib
     device = "cuda" if torch.cuda.is_available() else "cpu"
     results = []
+    ckpt_dir = "checkpoints/baselines"
+    Path(ckpt_dir).mkdir(parents=True, exist_ok=True)
 
     print("\n" + "=" * 70)
     print("BENCHMARK COMPARISON (Paper Table 2)")
@@ -144,6 +158,10 @@ def run_benchmark_comparison(
     ha_metrics = compute_metrics(ha_targets, ha_preds)
     results.append({"Model": "HA", **ha_metrics})
     print(f"  {ha_metrics}")
+    joblib.dump(ha, f"{ckpt_dir}/ha.joblib")
+    with open(f"{ckpt_dir}/ha_metrics.json", "w") as f:
+        json.dump(ha_metrics, f, indent=2)
+    print(f"  Saved checkpoint → {ckpt_dir}/ha.joblib")
 
     # 2. LSTM
     print("\n--- LSTM ---")
@@ -153,6 +171,7 @@ def run_benchmark_comparison(
     )
     results.append({"Model": "LSTM", **lstm_metrics})
     print(f"  {lstm_metrics}")
+    save_checkpoint(lstm, lstm_metrics, "lstm")
 
     # 3. TCN
     print("\n--- TCN ---")
@@ -162,6 +181,7 @@ def run_benchmark_comparison(
     )
     results.append({"Model": "TCN", **tcn_metrics})
     print(f"  {tcn_metrics}")
+    save_checkpoint(tcn, tcn_metrics, "tcn")
 
     # 4. Informer
     print("\n--- Informer ---")
@@ -171,6 +191,7 @@ def run_benchmark_comparison(
     )
     results.append({"Model": "Informer", **inf_metrics})
     print(f"  {inf_metrics}")
+    save_checkpoint(informer, inf_metrics, "informer")
 
     # 5. TFT (without DCP)
     print("\n--- TFT (baseline) ---")
@@ -180,6 +201,7 @@ def run_benchmark_comparison(
     )
     results.append({"Model": "TFT", **tft_metrics})
     print(f"  {tft_metrics}")
+    save_checkpoint(tft, tft_metrics, "tft_baseline")
 
     # 6. XGBoost
     print("\n--- XGBoost ---")
@@ -194,6 +216,10 @@ def run_benchmark_comparison(
         xgb_metrics = compute_metrics(y_test, xgb_preds)
         results.append({"Model": "XGBoost", **xgb_metrics})
         print(f"  {xgb_metrics}")
+        joblib.dump(xgb.model, f"{ckpt_dir}/xgboost.joblib")
+        with open(f"{ckpt_dir}/xgboost_metrics.json", "w") as f:
+            json.dump(xgb_metrics, f, indent=2)
+        print(f"  Saved checkpoint → {ckpt_dir}/xgboost.joblib")
 
         # Save feature importance for report
         importance = xgb.get_feature_importance(feature_cols)
@@ -211,6 +237,10 @@ def run_benchmark_comparison(
         lgbm_metrics = compute_metrics(y_test, lgbm_preds)
         results.append({"Model": "LightGBM", **lgbm_metrics})
         print(f"  {lgbm_metrics}")
+        joblib.dump(lgbm.model, f"{ckpt_dir}/lightgbm.joblib")
+        with open(f"{ckpt_dir}/lightgbm_metrics.json", "w") as f:
+            json.dump(lgbm_metrics, f, indent=2)
+        print(f"  Saved checkpoint → {ckpt_dir}/lightgbm.joblib")
     except (ImportError, NameError):
         print("  LightGBM not installed, skipping")
 
@@ -281,7 +311,6 @@ def run_ablation_study(
         "Experiment": 1, "Dynamic": "✓", "Retrieval": "✗",
         "MS-CA-EF": "✗", "Chain": "✗", **m1,
     })
-
     # Exp 2: + Historical Retrieval
     print("\n--- Exp 2: + Historical Retrieval ---")
     v2 = AblationVariant2(num_dynamic, num_static)
@@ -336,3 +365,4 @@ def run_ablation_study(
 
     df_results.to_csv("results/ablation_study.csv", index=False)
     return df_results
+

@@ -151,9 +151,10 @@ def train_model(config: Config, df: pd.DataFrame = None):
     print(f"  Total dynamic input dim: {config.model.num_dynamic_features}")
 
     # Temporal split
-    df["Month"] = pd.to_numeric(df["Month"], errors="coerce")
-    train_df = df[df["Month"].isin(config.data.train_months)]
-    val_df = df[df["Month"].isin(config.data.val_months)]
+    df["FlightDate"] = pd.to_datetime(df["FlightDate"], errors="coerce")
+    df["Year_int"] = df["FlightDate"].dt.year
+    train_df = df[df["Year_int"].isin([2019, 2022, 2023])]
+    val_df   = df[df["Year_int"] == 2024]
     print(f"\n  Train: {len(train_df):,} rows | Val: {len(val_df):,} rows")
 
     ds_kwargs = dict(
@@ -356,9 +357,10 @@ def run_baselines(config: Config, df: pd.DataFrame = None):
     num_dynamic = len(dynamic_cols) + len(weather_cols)
     num_static  = len(static_cols)
 
-    df["Month"] = pd.to_numeric(df["Month"], errors="coerce")
-    train_df = df[df["Month"].isin(config.data.train_months)]
-    test_df  = df[df["Month"].isin(config.data.val_months)]
+    df["FlightDate"] = pd.to_datetime(df["FlightDate"], errors="coerce")
+    df["Year_int"] = df["FlightDate"].dt.year
+    train_df = df[df["Year_int"].isin([2019, 2022, 2023])]
+    test_df  = df[df["Year_int"] == 2025]
 
     ds_kwargs = dict(
         static_cols=static_cols,
