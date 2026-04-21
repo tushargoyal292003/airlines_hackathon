@@ -69,9 +69,19 @@ class HistoricalRetrievalModule(nn.Module):
             if extreme_mask.sum() == 0:
                 continue
 
-            h_dynamic, h_global = encoder(dynamic[extreme_mask], mask[extreme_mask])
-            # Use global pooled embedding
-            self.update_database(h_global)
+            sub_dynamic = dynamic[extreme_mask]
+            sub_mask = mask[extreme_mask]
+            h_dynamic, _ = encoder(sub_dynamic, sub_mask)
+
+            # FIX: store h_current (last valid position) not h_global (mean pool).
+            # forward() is always called with h_current, so the pre-seeded embeddings
+            # must live in the same subspace or cosine similarity is meaningless.
+            lengths = sub_mask.sum(dim=1).long() - 1
+            lengths = lengths.clamp(min=0)
+            batch_idx = torch.arange(h_dynamic.size(0), device=h_dynamic.device)
+            h_current = h_dynamic[batch_idx, lengths]  # (B, D)
+
+            self.update_database(h_current)
             n_seeded += extreme_mask.sum().item()
 
         print(f"  Pre-seeded historical DB with {n_seeded} extreme-delay embeddings "

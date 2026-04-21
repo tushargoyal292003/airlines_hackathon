@@ -1116,6 +1116,36 @@ class DataPipeline:
         """
         df = df.copy()
 
+        # Preserve raw string Origin/Dest so downstream steps (proxy engineering,
+        # pair risk scoring) can still filter on "DFW" after encoding.
+        if "Origin" in df.columns:
+            df["Origin_str"] = df["Origin"].astype(str)
+        if "Dest" in df.columns:
+            df["Dest_str"] = df["Dest"].astype(str)
+
+        # Preserve raw HHMM scheduled/actual times for proxy engineering
+        # (Min-Max normalization below would otherwise destroy them).
+        for tcol in ["CRSDepTime", "CRSArrTime", "DepTime", "ArrTime"]:
+            if tcol in df.columns:
+                df[f"{tcol}_raw"] = pd.to_numeric(df[tcol], errors="coerce")
+
+        # Calendar fields: keep raw copies for train/val/test splitting,
+        # and cyclical-encode Month + DayOfWeek so the model sees their wrap-around.
+        if "Year" in df.columns:
+            df["Year_raw"] = pd.to_numeric(df["Year"], errors="coerce").astype("Int64")
+        if "Month" in df.columns:
+            m = pd.to_numeric(df["Month"], errors="coerce")
+            df["Month_raw"] = m.astype("Int64")
+            df["Month_sin"] = np.sin(2 * np.pi * m / 12)
+            df["Month_cos"] = np.cos(2 * np.pi * m / 12)
+            df = df.drop(columns=["Month"])
+        if "DayOfWeek" in df.columns:
+            d = pd.to_numeric(df["DayOfWeek"], errors="coerce")
+            df["DayOfWeek_raw"] = d.astype("Int64")
+            df["DayOfWeek_sin"] = np.sin(2 * np.pi * d / 7)
+            df["DayOfWeek_cos"] = np.cos(2 * np.pi * d / 7)
+            df = df.drop(columns=["DayOfWeek"])
+
         # OriginState / DestState are string categoricals — encode them too.
         # OriginCityName / DestCityName are kept in the df for reporting
         # but are too high-cardinality to be useful model features.
@@ -1141,7 +1171,10 @@ class DataPipeline:
                 print(f"  Target-mean encoded (fallback): {available_cats}")
 
         numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-        exclude = ["DepDelay", "DepDelayMinutes", "chain_id", "chain_position"]
+        exclude = ["DepDelay", "DepDelayMinutes", "chain_id", "chain_position",
+                   "Year_raw", "Month_raw", "DayOfWeek_raw",
+                   "CRSDepTime_raw", "CRSArrTime_raw", "DepTime_raw", "ArrTime_raw",
+                   "Month_sin", "Month_cos", "DayOfWeek_sin", "DayOfWeek_cos"]
         norm_cols = [c for c in numeric_cols if c not in exclude]
 
         if norm_cols:
@@ -1208,8 +1241,8 @@ def get_feature_groups(df: pd.DataFrame) -> dict:
         # ── Airborne time ──────────────────────────────────────────────
         "actual_airborne",                       # WheelsOn - WheelsOff (real)
         "airborne_excess",                       # actual - AirTime (routing/winds)
-        # ── Temporal ───────────────────────────────────────────────────
-        "DayOfWeek", "Month",
+        # ── Temporal (cyclical) ────────────────────────────────────────
+        "Month_sin", "Month_cos", "DayOfWeek_sin", "DayOfWeek_cos",
         # ── Chain propagation ──────────────────────────────────────────
         "prev_arr_delay",                        # how late was the inbound aircraft
         "turnaround_minutes",                    # gate time before next departure
@@ -1223,9 +1256,22 @@ def get_feature_groups(df: pd.DataFrame) -> dict:
         "prev_lateaircraftdelay",
     ]
 
+    # Framing A (causal): drop any column that's only knowable post-departure
+    # or depends on same-day chain observations.
+    _LEAKY = {
+        "actual_taxi_out", "taxi_out_excess", "actual_airborne", "airborne_excess",
+        "TaxiOut", "AirTime", "WheelsOff", "WheelsOn",
+        "DepTime", "ArrTime", "DepTime_raw", "ArrTime_raw",
+        "ArrDelay", "ArrDelayMinutes", "DepDelayMinutes",
+        "prev_arr_delay", "prev_dep_delay",
+        "prev_carrierdelay", "prev_weatherdelay", "prev_nasdelay",
+        "prev_securitydelay", "prev_lateaircraftdelay",
+        "cum_delay_past_hour",   # real-time operational signal, not available pre-season
+    }
+
     available = set(df.columns)
     return {
-        "airport": [c for c in airport_features if c in available],
-        "weather": [c for c in weather_features if c in available],
-        "flight":  [c for c in flight_features  if c in available],
+        "airport": [c for c in airport_features if c in available and c not in _LEAKY],
+        "weather": [c for c in weather_features if c in available and c not in _LEAKY],
+        "flight":  [c for c in flight_features  if c in available and c not in _LEAKY],
     }

@@ -57,6 +57,7 @@ class Trainer:
         config: Config,
         rank: int = 0,
         world_size: int = 1,
+        resume_from: str = None,
     ):
         self.config = config
         self.rank = rank
@@ -92,6 +93,18 @@ class Trainer:
         # Early stopping
         self.best_val_loss = float("inf")
         self.patience_counter = 0
+        self.start_epoch = 1
+
+        # Resume from checkpoint if provided
+        if resume_from is not None:
+            ckpt = torch.load(resume_from, map_location=self.device, weights_only=False)
+            self.raw_model.load_state_dict(ckpt["model_state_dict"])
+            self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            self.start_epoch = ckpt["epoch"] + 1
+            self.best_val_loss = ckpt.get("val_loss", float("inf"))
+            if self.is_main:
+                print(f"  Resumed from {resume_from} (epoch {ckpt['epoch']}, "
+                      f"val_loss {self.best_val_loss:.4f})")
 
         # Logging
         self.log_dir = Path(config.train.log_dir)
@@ -240,12 +253,14 @@ class Trainer:
             # Combined loss: MSE + weighted L1 for extreme delays
             loss_mse = self.criterion(output["prediction"], target)
 
-            # Extra weight on extreme delays (>180 min)
-            extreme_mask = (target > 180).float()
-            if extreme_mask.sum() > 0:
+            # Extra weight on extreme delays.
+            # Important: compute L1 only on extreme rows (no zero-masking dilution).
+            extreme_thr = float(self.config.data.extreme_delay_threshold)
+            extreme_mask = target > extreme_thr
+            if extreme_mask.any():
                 extreme_loss = self.l1_loss(
-                    output["prediction"] * extreme_mask,
-                    target * extreme_mask,
+                    output["prediction"][extreme_mask],
+                    target[extreme_mask],
                 )
                 loss = loss_mse + 0.3 * extreme_loss
             else:
@@ -318,7 +333,7 @@ class Trainer:
                 max_batches=50,
             )
 
-        for epoch in range(1, self.config.train.num_epochs + 1):
+        for epoch in range(self.start_epoch, self.config.train.num_epochs + 1):
             if self.device.type == "cuda" and self.device.index is not None:
                 torch.cuda.reset_peak_memory_stats(self.device.index)
 
@@ -396,11 +411,17 @@ class Trainer:
         }, path)
 
     def save_history(self):
+        def _coerce(o):
+            import numpy as np
+            if isinstance(o, (np.floating,)):  return float(o)
+            if isinstance(o, (np.integer,)):   return int(o)
+            if isinstance(o, np.ndarray):      return o.tolist()
+            raise TypeError(f"not serializable: {type(o).__name__}")
         with open(self.log_dir / "training_history.json", "w") as f:
-            json.dump(self.history, f, indent=2)
+            json.dump(self.history, f, indent=2, default=_coerce)
 
 
-def train_distributed(rank, world_size, config, train_dataset, val_dataset):
+def train_distributed(rank, world_size, config, train_dataset, val_dataset, resume_from=None):
     """Entry point for distributed training."""
     setup_distributed(rank, world_size)
 
@@ -435,13 +456,14 @@ def train_distributed(rank, world_size, config, train_dataset, val_dataset):
         dropout=config.model.dropout,
     )
 
-    trainer = Trainer(model, train_loader, val_loader, config, rank, world_size)
+    trainer = Trainer(model, train_loader, val_loader, config, rank, world_size,
+                      resume_from=resume_from)
     trainer.train()
 
     cleanup()
 
 
-def train_single_gpu(config, train_dataset, val_dataset):
+def train_single_gpu(config, train_dataset, val_dataset, resume_from=None):
     """Single GPU training (fallback)."""
     train_loader = DataLoader(
         train_dataset,
@@ -468,7 +490,7 @@ def train_single_gpu(config, train_dataset, val_dataset):
         dropout=config.model.dropout,
     )
 
-    trainer = Trainer(model, train_loader, val_loader, config)
+    trainer = Trainer(model, train_loader, val_loader, config, resume_from=resume_from)
     trainer.train()
 
     return trainer

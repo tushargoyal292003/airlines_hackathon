@@ -25,11 +25,12 @@ class HistoricalAverage:
     def fit(self, df: pd.DataFrame):
         """Compute averages by (origin, dest, day_of_week, hour)."""
         df = df.copy()
-        df["dep_hour"] = pd.to_numeric(
-            df["CRSDepTime"].astype(str).str.zfill(4).str[:2], errors="coerce"
-        )
+        dow_col = "DayOfWeek_raw" if "DayOfWeek_raw" in df.columns else "DayOfWeek"
+        t_col = "CRSDepTime_raw" if "CRSDepTime_raw" in df.columns else "CRSDepTime"
+        df["dep_hour"] = (pd.to_numeric(df[t_col], errors="coerce") // 100).fillna(-1).astype(int)
+        self._dow_col = dow_col
         self.averages = (
-            df.groupby(["Origin", "Dest", "DayOfWeek", "dep_hour"])["DepDelay"]
+            df.groupby(["Origin", "Dest", dow_col, "dep_hour"])["DepDelay"]
             .mean()
             .to_dict()
         )
@@ -37,12 +38,12 @@ class HistoricalAverage:
 
     def predict(self, df: pd.DataFrame) -> np.ndarray:
         df = df.copy()
-        df["dep_hour"] = pd.to_numeric(
-            df["CRSDepTime"].astype(str).str.zfill(4).str[:2], errors="coerce"
-        )
+        dow_col = getattr(self, "_dow_col", "DayOfWeek_raw" if "DayOfWeek_raw" in df.columns else "DayOfWeek")
+        t_col = "CRSDepTime_raw" if "CRSDepTime_raw" in df.columns else "CRSDepTime"
+        df["dep_hour"] = (pd.to_numeric(df[t_col], errors="coerce") // 100).fillna(-1).astype(int)
         preds = []
         for _, row in df.iterrows():
-            key = (row["Origin"], row["Dest"], row["DayOfWeek"], row["dep_hour"])
+            key = (row["Origin"], row["Dest"], row[dow_col], row["dep_hour"])
             preds.append(self.averages.get(key, self.global_avg))
         return np.array(preds)
 

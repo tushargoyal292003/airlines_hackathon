@@ -31,9 +31,23 @@ class DataConfig:
     # Extreme delay threshold (minutes) per paper Section 3.1.2
     extreme_delay_threshold: int = 180
 
-    # Train/val/test split (months)
-    train_months: List[int] = field(default_factory=lambda: list(range(1, 11)))  # Jan-Oct
-    val_months: List[int] = field(default_factory=lambda: [11, 12])             # Nov-Dec
+    # Train/val/test split — YEAR-based (holds out 2025 as true future test set)
+    train_years: List[int] = field(default_factory=lambda: [2019, 2022, 2023])
+    val_years:   List[int] = field(default_factory=lambda: [2024])
+    test_years:  List[int] = field(default_factory=lambda: [2025])
+
+    # Legacy month-based split (kept for backwards-compat; only applied if
+    # train_years/val_years are empty)
+    train_months: List[int] = field(default_factory=lambda: list(range(1, 13)))
+    val_months:   List[int] = field(default_factory=lambda: list(range(1, 13)))
+
+    # Seasonal breakdown for test-year evaluation (Northern hemisphere)
+    seasons: dict = field(default_factory=lambda: {
+        "winter": [12, 1, 2],
+        "spring": [3, 4, 5],
+        "summer": [6, 7, 8],
+        "fall":   [9, 10, 11],
+    })
 
     # Normalization
     normalization: str = "minmax"
@@ -44,7 +58,7 @@ class ModelConfig:
     # Paper Section 4.2.2 hyperparameters
     hidden_dim: int = 128
     dropout: float = 0.1
-    sequence_length: int = 14
+    sequence_length: int = 8   # FIX: reduced from 14; avg chain=4.1, p95=~8 → less padding dilution
 
     # TCN encoder
     tcn_num_channels: List[int] = field(default_factory=lambda: [64, 128, 128])
@@ -94,6 +108,7 @@ class TrainConfig:
     log_dir: str = "./logs"
     checkpoint_dir: str = "./checkpoints"
     save_every: int = 5
+    resume_from: str = None   # path to checkpoint to resume from
 
 
 @dataclass

@@ -1,23 +1,33 @@
-__pycache__/
-*.py[cod]
-.pytest_cache/
-.mypy_cache/
-.coverage
-
-.DS_Store
-.vscode/
-.idea/
-
-logs/
-checkpoints/
-results/
-*.pt
-*.pth
-*.parquet
-*.jsonl
-
+# Large data files
 data/raw/
 data/processed/
-data/data_bts/raw/
-data/data_noaa/raw/
-data/data_aspm/
+
+# Model checkpoints
+checkpoints/
+
+# Run logs (large)
+logs/run/
+logs/preprocess_console.log
+logs/train_console.log
+logs/train_extreme_fix_*.log
+logs/resource_usage.jsonl
+
+# Intermediate result CSVs/JSONs
+results/*.csv
+results/*.json
+results/lightgbm/
+results/pair_ranking_eval/
+
+# Keep report figures
+!results/report_figures/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store

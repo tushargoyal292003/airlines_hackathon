@@ -47,7 +47,10 @@ class FlightChainDataset(Dataset):
             raise ValueError("Missing required column: chain_id")
 
         keep_cols = list(dict.fromkeys(
-            ["chain_id", "CRSDepTime", "Origin", "Dest", "prev_arr_delay", "turnaround_minutes"]
+            ["chain_id", "CRSDepTime", "Origin", "Dest", "Origin_str", "Dest_str",
+             "Year", "Year_raw", "Month", "Month_raw", "Month_sin", "Month_cos",
+             "DayOfWeek_sin", "DayOfWeek_cos",
+             "prev_arr_delay", "turnaround_minutes"]
             + self.static_cols
             + self.all_dynamic
             + [self.target_col]
@@ -89,15 +92,27 @@ class FlightChainDataset(Dataset):
         self.turnaround = work_df["turnaround_minutes"].to_numpy(dtype=np.float32, copy=True)
 
         n_rows = len(work_df)
-        if "Origin" in work_df.columns:
-            self.origin = work_df["Origin"].astype(str).to_numpy(copy=True)
+        origin_src = "Origin_str" if "Origin_str" in work_df.columns else "Origin"
+        dest_src   = "Dest_str"   if "Dest_str"   in work_df.columns else "Dest"
+        if origin_src in work_df.columns:
+            self.origin = work_df[origin_src].astype(str).to_numpy(copy=True)
         else:
             self.origin = np.full(n_rows, "", dtype=object)
-        if "Dest" in work_df.columns:
-            self.dest = work_df["Dest"].astype(str).to_numpy(copy=True)
+        if dest_src in work_df.columns:
+            self.dest = work_df[dest_src].astype(str).to_numpy(copy=True)
         else:
             self.dest = np.full(n_rows, "", dtype=object)
         self.chain_id_values = work_df["chain_id"].to_numpy(copy=True)
+        year_src = "Year_raw" if "Year_raw" in work_df.columns else "Year"
+        month_src = "Month_raw" if "Month_raw" in work_df.columns else "Month"
+        if year_src in work_df.columns:
+            self.year_values = pd.to_numeric(work_df[year_src], errors="coerce").fillna(0).astype(int).to_numpy(copy=True)
+        else:
+            self.year_values = np.zeros(n_rows, dtype=int)
+        if month_src in work_df.columns:
+            self.month_values = pd.to_numeric(work_df[month_src], errors="coerce").fillna(0).astype(int).to_numpy(copy=True)
+        else:
+            self.month_values = np.zeros(n_rows, dtype=int)
 
         self.chain_rows: List[np.ndarray] = []
         self.chain_ids: List[str] = []
@@ -165,6 +180,8 @@ class FlightChainDataset(Dataset):
             "origin": self.origin[target_row],
             "dest": self.dest[target_row],
             "chain_id": self.chain_id_values[target_row],
+            "year": int(self.year_values[target_row]),
+            "month": int(self.month_values[target_row]),
         }
 
 
@@ -180,6 +197,8 @@ def flight_collate_fn(batch: List[Dict]) -> Dict:
     for key in ["origin", "dest"]:
         result[key] = [b[key] for b in batch]
     result["chain_id"] = [b["chain_id"] for b in batch]
+    result["year"] = [b["year"] for b in batch]
+    result["month"] = [b["month"] for b in batch]
     return result
 
 

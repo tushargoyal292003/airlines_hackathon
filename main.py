@@ -23,6 +23,10 @@ import torch.multiprocessing as mp
 import pandas as pd
 import numpy as np
 from pathlib import Path
+try:
+    from sklearn.metrics import average_precision_score
+except Exception:
+    average_precision_score = None
 
 from config import Config, DataConfig, ModelConfig, TrainConfig
 from data.preprocessor import DataPipeline, get_feature_groups
@@ -31,6 +35,10 @@ from data.proxy_engineering import ProxyEngineer
 from model import TFTDCP
 from train import train_distributed, train_single_gpu, Trainer
 from risk_scorer import PairRiskScorer
+from causal_features import (
+    CAUSAL_FEATURES, BLACKLIST, drop_blacklist,
+    build_route_priors, attach_priors,
+)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -55,15 +63,40 @@ def results_dir(config: Config) -> Path:
 # PHASE 1: PREPROCESS
 # ══════════════════════════════════════════════════════════════
 
-def preprocess(config: Config):
-    """Run data pipeline + proxy engineering."""
-    print("\n" + "=" * 70)
-    print("PHASE 1A: DATA PREPROCESSING")
-    print("=" * 70)
+def preprocess(config: Config, force: bool = False):
+    """Run data pipeline + proxy engineering.
 
-    pipeline = DataPipeline(config.data)
-    df = pipeline.run(save=True)          # saves processed_flights.parquet
-                                          # to config.data.processed_dir
+    If processed_flights.parquet already exists and `force=False`, skip the
+    expensive Phase 1A load/merge and reuse it.  Set `force=True` (or delete
+    the parquet) to rerun preprocessing from scratch.
+    """
+    flights_path = processed_dir(config) / "processed_flights.parquet"
+
+    if flights_path.exists() and not force:
+        print("\n" + "=" * 70)
+        print(f"PHASE 1A: SKIPPED — reusing cached {flights_path.name}")
+        print("=" * 70)
+        df = pd.read_parquet(flights_path)
+        print(f"  Loaded {len(df):,} records × {len(df.columns)} cols")
+    else:
+        print("\n" + "=" * 70)
+        print("PHASE 1A: DATA PREPROCESSING")
+        print("=" * 70)
+        pipeline = DataPipeline(config.data)
+        df = pipeline.run(save=True)          # saves processed_flights.parquet
+                                              # to config.data.processed_dir
+
+    # ── Framing A (causal): drop leaky cols, attach leak-safe route priors ──
+    print("\n  [causal] dropping blacklist + attaching historical priors")
+    year_col = "Year_raw" if "Year_raw" in df.columns else "Year"
+    df[year_col] = pd.to_numeric(df[year_col], errors="coerce")
+    prior_years = list(config.data.train_years) + list(config.data.val_years)
+    priors = build_route_priors(df, prior_years=prior_years, year_col=year_col)
+    df = drop_blacklist(df)
+    df = attach_priors(df, priors)
+    # rewrite parquet so evaluate/baselines see the causal columns
+    df.to_parquet(flights_path, index=False)
+    print(f"  [causal] priors attached from years {prior_years} → re-saved parquet")
 
     feature_groups = get_feature_groups(df)
     print("\n--- Feature Summary ---")
@@ -97,17 +130,32 @@ def preprocess(config: Config):
 # ══════════════════════════════════════════════════════════════
 
 def _resolve_feature_cols(df: pd.DataFrame):
-    """Determine static, dynamic, and weather column lists from the data."""
+    """Determine static, dynamic, and weather column lists — CAUSAL ONLY.
+
+    Framing A: no actuals, no same-day chain observations. All leaky columns
+    are removed via BLACKLIST; historical priors replace same-day propagation.
+    """
     feature_groups = get_feature_groups(df)
 
-    static_cols = ["Origin", "Dest", "CRSDepTime", "CRSArrTime",
-                   "Distance", "DayOfWeek", "Month", "Reporting_Airline"]
-    static_cols = [c for c in static_cols if c in df.columns]
+    static_cols = ["Origin", "Dest", "CRSDepTime", "CRSArrTime", "Distance",
+                   "Month_sin", "Month_cos", "DayOfWeek_sin", "DayOfWeek_cos",
+                   "Reporting_Airline"]
+    static_cols = [c for c in static_cols if c in df.columns and c not in BLACKLIST]
 
     dynamic_cols = feature_groups["flight"] + feature_groups["airport"]
-    dynamic_cols = [c for c in dynamic_cols if c not in static_cols and c in df.columns]
+    dynamic_cols = [
+        c for c in dynamic_cols
+        if c not in static_cols and c in df.columns and c not in BLACKLIST
+    ]
 
-    weather_cols = [c for c in feature_groups["weather"] if c in df.columns]
+    weather_cols = [c for c in feature_groups["weather"]
+                    if c in df.columns and c not in BLACKLIST]
+
+    # Append the leak-safe priors as static features (one value per row, time-invariant)
+    prior_cols = [c for c in CAUSAL_FEATURES if c.endswith("_prior") and c in df.columns]
+    for c in prior_cols:
+        if c not in static_cols:
+            static_cols.append(c)
 
     return static_cols, dynamic_cols, weather_cols
 
@@ -150,12 +198,16 @@ def train_model(config: Config, df: pd.DataFrame = None):
     print(f"  Weather features ({len(weather_cols)}): {weather_cols}")
     print(f"  Total dynamic input dim: {config.model.num_dynamic_features}")
 
-    # Temporal split
-    df["FlightDate"] = pd.to_datetime(df["FlightDate"], errors="coerce")
-    df["Year_int"] = df["FlightDate"].dt.year
-    train_df = df[df["Year_int"].isin([2019, 2022, 2023])]
-    val_df   = df[df["Year_int"] == 2024]
-    print(f"\n  Train: {len(train_df):,} rows | Val: {len(val_df):,} rows")
+    # Temporal split — year-based (2025 held out for final test)
+    year_col = "Year_raw" if "Year_raw" in df.columns else "Year"
+    df[year_col] = pd.to_numeric(df[year_col], errors="coerce")
+    df["Year"] = df[year_col]  # alias so downstream .isin() works unchanged
+    train_df = df[df["Year"].isin(config.data.train_years)]
+    val_df   = df[df["Year"].isin(config.data.val_years)]
+    test_df  = df[df["Year"].isin(config.data.test_years)]
+    print(f"\n  Train years {config.data.train_years}: {len(train_df):,} rows")
+    print(f"  Val   years {config.data.val_years}: {len(val_df):,} rows")
+    print(f"  Test  years {config.data.test_years}: {len(test_df):,} rows (held out, not used for training)")
 
     ds_kwargs = dict(
         static_cols=static_cols,
@@ -175,12 +227,12 @@ def train_model(config: Config, df: pd.DataFrame = None):
         print(f"  Launching DDP on {num_gpus} GPUs")
         mp.spawn(
             train_distributed,
-            args=(num_gpus, config, train_dataset, val_dataset),
+            args=(num_gpus, config, train_dataset, val_dataset, config.train.resume_from),
             nprocs=num_gpus,
             join=True,
         )
     else:
-        train_single_gpu(config, train_dataset, val_dataset)
+        train_single_gpu(config, train_dataset, val_dataset, config.train.resume_from)
 
     # Save feature column metadata so evaluate() can reconstruct the model
     # without needing the df in memory
@@ -273,10 +325,16 @@ def evaluate(config: Config, df: pd.DataFrame = None, proxy_df: pd.DataFrame = N
     beta = torch.nn.functional.softplus(model.delay_propagation.beta).item()
     print(f"  Learned β: {beta:.4f} (paper range: 0.73–0.89)")
 
-    # ── Build test dataset & score ────────────────────────────────────────
+    # ── Restrict to held-out test year(s): 2025 ──────────────────────────
     from torch.utils.data import DataLoader
+    year_col = "Year_raw" if "Year_raw" in df.columns else "Year"
+    df[year_col] = pd.to_numeric(df[year_col], errors="coerce")
+    df["Year"] = df[year_col]  # alias so downstream .isin() works unchanged
+    test_df = df[df["Year"].isin(config.data.test_years)].copy()
+    print(f"\n  Test set: {len(test_df):,} rows from years {config.data.test_years}")
+
     test_dataset = FlightChainDataset(
-        df,
+        test_df,
         static_cols=static_cols,
         dynamic_cols=dynamic_cols,
         weather_cols=weather_cols,
@@ -305,10 +363,100 @@ def evaluate(config: Config, df: pd.DataFrame = None, proxy_df: pd.DataFrame = N
     ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
     r2 = 1 - ss_res / max(ss_tot, 1e-8)
 
-    print(f"\n  ── Flight-Level Metrics ──")
+    print(f"\n  ── Flight-Level Metrics (Test = {config.data.test_years}) ──")
     print(f"  MAE:  {mae:.2f} min")
     print(f"  RMSE: {rmse:.2f} min")
     print(f"  R²:   {r2:.4f}")
+
+    # Tail-focused regression metrics on delayed subsets
+    tail_thresholds = [15, 60, 180]
+    tail_metrics = {}
+    print("\n  ── Tail-Focused Regression Metrics ──")
+    print(f"  {'Subset':<14} {'N':>9}  {'Pct':>7}  {'MAE':>7}  {'RMSE':>7}")
+    for t in tail_thresholds:
+        m = y_true > t
+        n_t = int(m.sum())
+        if n_t == 0:
+            tail_metrics[f"gt_{t}"] = {
+                "threshold_minutes": int(t),
+                "n": 0,
+                "pct_of_test": 0.0,
+                "MAE": None,
+                "RMSE": None,
+            }
+            print(f"  >{t:<12} {0:>9,}  {0.00:>6.2f}%  {'-':>7}  {'-':>7}")
+            continue
+        yt = y_true[m]
+        yp = y_pred[m]
+        t_mae = float(np.mean(np.abs(yt - yp)))
+        t_rmse = float(np.sqrt(np.mean((yt - yp) ** 2)))
+        pct = float(100.0 * n_t / max(len(y_true), 1))
+        tail_metrics[f"gt_{t}"] = {
+            "threshold_minutes": int(t),
+            "n": n_t,
+            "pct_of_test": round(pct, 2),
+            "MAE": round(t_mae, 2),
+            "RMSE": round(t_rmse, 2),
+        }
+        print(f"  >{t:<12} {n_t:>9,}  {pct:>6.2f}%  {t_mae:>7.2f}  {t_rmse:>7.2f}")
+
+    # Extreme-event classification for actual delay > 180 minutes
+    extreme_thr = 180
+    y_true_ext = (y_true > extreme_thr).astype(np.int32)
+    y_pred_ext = (y_pred > extreme_thr).astype(np.int32)
+
+    tp = int(((y_true_ext == 1) & (y_pred_ext == 1)).sum())
+    fp = int(((y_true_ext == 0) & (y_pred_ext == 1)).sum())
+    fn = int(((y_true_ext == 1) & (y_pred_ext == 0)).sum())
+    tn = int(((y_true_ext == 0) & (y_pred_ext == 0)).sum())
+
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
+    prevalence = float(y_true_ext.mean() * 100.0)
+
+    auprc = None
+    if average_precision_score is not None and y_true_ext.min() != y_true_ext.max():
+        try:
+            auprc = float(average_precision_score(y_true_ext, y_pred))
+        except Exception:
+            auprc = None
+
+    print("\n  ── Extreme-Event Classification (DepDelay > 180 min) ──")
+    print(f"  Positives: {int(y_true_ext.sum()):,}/{len(y_true_ext):,} ({prevalence:.2f}%)")
+    print(f"  Precision: {precision:.4f}")
+    print(f"  Recall:    {recall:.4f}")
+    print(f"  F1:        {f1:.4f}")
+    if auprc is not None:
+        print(f"  AUPRC:     {auprc:.4f}")
+    else:
+        print("  AUPRC:     unavailable")
+
+    # ── Seasonal breakdown on the test year ───────────────────────────────
+    seasonal_metrics = {}
+    print(f"\n  ── Seasonal Breakdown (Test = {config.data.test_years}) ──")
+    print(f"  {'Season':<8} {'N':>8}  {'MAE':>7}  {'RMSE':>7}  {'R²':>7}  {'ExtremePct':>11}")
+    for season, months in config.data.seasons.items():
+        m = flight_preds["month"].isin(months)
+        if m.sum() == 0:
+            continue
+        yt = flight_preds.loc[m, "actual_delay"].values
+        yp = flight_preds.loc[m, "pred_delay"].values
+        s_mae = float(np.mean(np.abs(yt - yp)))
+        s_rmse = float(np.sqrt(np.mean((yt - yp) ** 2)))
+        s_ss_res = float(np.sum((yt - yp) ** 2))
+        s_ss_tot = float(np.sum((yt - np.mean(yt)) ** 2))
+        s_r2 = 1 - s_ss_res / max(s_ss_tot, 1e-8)
+        s_extreme = float((yt > 180).mean() * 100)
+        seasonal_metrics[season] = {
+            "n": int(m.sum()),
+            "MAE": round(s_mae, 2),
+            "RMSE": round(s_rmse, 2),
+            "R2": round(s_r2, 4),
+            "extreme_pct": round(s_extreme, 2),
+            "months": months,
+        }
+        print(f"  {season:<8} {m.sum():>8,}  {s_mae:>7.2f}  {s_rmse:>7.2f}  {s_r2:>7.4f}  {s_extreme:>10.2f}%")
 
     # ── Aggregate pair risks + export ─────────────────────────────────────
     pair_risks = scorer.aggregate_pair_risks(
@@ -321,13 +469,53 @@ def evaluate(config: Config, df: pd.DataFrame = None, proxy_df: pd.DataFrame = N
     flight_preds.to_csv(rdir / "flight_predictions.csv", index=False)
 
     metrics = {
-        "MAE": round(mae, 2),
-        "RMSE": round(rmse, 2),
-        "R2": round(r2, 4),
-        "beta": round(beta, 4),
+        "test_years": list(config.data.test_years),
+        "overall": {
+            "MAE": round(mae, 2),
+            "RMSE": round(rmse, 2),
+            "R2": round(r2, 4),
+            "beta": round(beta, 4),
+            "n_flights": int(len(flight_preds)),
+        },
+        "tail_regression": tail_metrics,
+        "extreme_event_classification": {
+            "event_threshold_minutes": int(extreme_thr),
+            "prediction_threshold_minutes": int(extreme_thr),
+            "n": int(len(y_true_ext)),
+            "n_positive": int(y_true_ext.sum()),
+            "prevalence_pct": round(prevalence, 2),
+            "tp": tp,
+            "fp": fp,
+            "tn": tn,
+            "fn": fn,
+            "precision": round(float(precision), 4),
+            "recall": round(float(recall), 4),
+            "f1": round(float(f1), 4),
+            "auprc": (round(float(auprc), 4) if auprc is not None else None),
+        },
+        "seasonal": seasonal_metrics,
     }
     with open(rdir / "metrics.json", "w") as f:
         json.dump(metrics, f, indent=2)
+
+    # ── Per-season pair risk CSVs (seasonal A→DFW→B recommendations) ────
+    for season, months in config.data.seasons.items():
+        sub = flight_preds[flight_preds["month"].isin(months)]
+        if len(sub) == 0:
+            continue
+        s_pairs = scorer.aggregate_pair_risks(
+            sub, hub=config.data.hub_airport, proxy_df=proxy_df,
+        )
+        s_pairs.to_csv(rdir / f"pair_risk_scores_{season}.csv", index=False)
+        if "is_feasible" in s_pairs.columns and "risk_score" in s_pairs.columns:
+            s_flagged = s_pairs[
+                (s_pairs["is_feasible"] == 1) & (s_pairs["risk_score"] >= 0.6)
+            ]
+        else:
+            # Backward compatibility for older scorer outputs.
+            s_flagged = s_pairs[s_pairs["final_score"] >= 0.6]
+        s_flagged.to_csv(rdir / f"flagged_pairs_{season}.csv", index=False)
+        print(f"  {season}: {len(s_pairs):,} pairs, {len(s_flagged):,} flagged")
 
     print(f"\n  All results saved to {rdir}/")
 
@@ -357,10 +545,11 @@ def run_baselines(config: Config, df: pd.DataFrame = None):
     num_dynamic = len(dynamic_cols) + len(weather_cols)
     num_static  = len(static_cols)
 
-    df["FlightDate"] = pd.to_datetime(df["FlightDate"], errors="coerce")
-    df["Year_int"] = df["FlightDate"].dt.year
-    train_df = df[df["Year_int"].isin([2019, 2022, 2023])]
-    test_df  = df[df["Year_int"] == 2025]
+    year_col = "Year_raw" if "Year_raw" in df.columns else "Year"
+    df[year_col] = pd.to_numeric(df[year_col], errors="coerce")
+    df["Year"] = df[year_col]  # alias so downstream .isin() works unchanged
+    train_df = df[df["Year"].isin(config.data.train_years)]
+    test_df  = df[df["Year"].isin(config.data.test_years)]
 
     ds_kwargs = dict(
         static_cols=static_cols,
@@ -428,6 +617,10 @@ def main():
     parser.add_argument("--epochs",    type=int,  default=100)
     parser.add_argument("--batch-size",type=int,  default=128)
     parser.add_argument("--lr",        type=float, default=0.001)
+    parser.add_argument("--force-preprocess", action="store_true",
+                        help="Re-run Phase 1A even if processed_flights.parquet exists")
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Path to checkpoint to resume training from")
     args = parser.parse_args()
 
     config = Config(
@@ -444,6 +637,7 @@ def main():
             num_epochs=args.epochs,
             batch_size=args.batch_size,
             learning_rate=args.lr,
+            resume_from=args.resume,
         ),
     )
 
@@ -451,7 +645,7 @@ def main():
     proxy_df = None
 
     if args.mode in ("preprocess", "all"):
-        df, proxy_df = preprocess(config)
+        df, proxy_df = preprocess(config, force=args.force_preprocess)
 
     if args.mode in ("train", "all"):
         train_model(config, df)          # df=None when --mode train → loads from disk

@@ -17,6 +17,9 @@ class ProxyEngineer:
     """Computes regulatory proxy features for A→DFW→B sequences."""
 
     MCT_MINUTES = 45        # Minimum Connection Time at DFW
+    # Pair-level infeasibility policy: a pair is infeasible only when
+    # MCT violations are persistent, not when they occur once.
+    MCT_INFEASIBLE_RATE = 0.50
     DUTY_LIMIT_MINS = 840   # 14 hours in minutes
     DUTY_WARN_MINS = 720    # 12 hours soft warning
     WOCL_START = 2           # Window Of Circadian Low start (2 AM)
@@ -33,13 +36,34 @@ class ProxyEngineer:
         """
         hub = self.hub
 
-        # Split into inbound (→DFW) and outbound (DFW→)
-        inbound = df[df["Dest"] == hub].copy()
-        outbound = df[df["Origin"] == hub].copy()
+        # Split into inbound (→DFW) and outbound (DFW→).
+        # Prefer raw string columns (preserved by preprocessor) since
+        # Origin/Dest may have been James-Stein-encoded to floats.
+        origin_col = "Origin_str" if "Origin_str" in df.columns else "Origin"
+        dest_col   = "Dest_str"   if "Dest_str"   in df.columns else "Dest"
+
+        # Slim to only the columns proxy engineering needs — otherwise the
+        # inbound × outbound merge carries 75 cols × ~1B rows and OOMs.
+        keep = [origin_col, dest_col, "FlightDate",
+                "CRSDepTime", "CRSArrTime", "DepTime", "ArrTime"]
+        keep = [c for c in keep if c in df.columns]
+
+        inbound = df.loc[df[dest_col] == hub, keep].copy()
+        outbound = df.loc[df[origin_col] == hub, keep].copy()
 
         if len(inbound) == 0 or len(outbound) == 0:
             print(f"  WARNING: No inbound or outbound flights to {hub}")
             return pd.DataFrame()
+
+        # Dedupe: proxy features depend on (airport, date, scheduled times)
+        # only — collapse duplicate schedule rows so the merge stays bounded.
+        inbound = inbound.drop_duplicates(
+            subset=[origin_col, "FlightDate", "CRSDepTime", "CRSArrTime"]
+        )
+        outbound = outbound.drop_duplicates(
+            subset=[dest_col, "FlightDate", "CRSDepTime", "CRSArrTime"]
+        )
+        print(f"  After slim+dedupe: {len(inbound):,} inbound × {len(outbound):,} outbound")
 
         # Parse times as minutes since midnight
         for subset, prefix in [(inbound, "in"), (outbound, "out")]:
@@ -140,8 +164,134 @@ class ProxyEngineer:
         return seq
 
     def run(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Full proxy pipeline: enumerate pairs → compute proxies."""
-        sequences = self.build_sequences(df)
-        if len(sequences) == 0:
-            return sequences
-        return self.compute_proxies(sequences)
+        """
+        Full proxy pipeline.  Enumerating every inbound×outbound combo on the
+        same day blows up to ~1B rows at DFW scale.  Instead we process one
+        day at a time, compute proxies, and aggregate to (airport_a, airport_b)
+        worst-case per day — concatenated across days this stays bounded.
+        """
+        hub = self.hub
+        origin_col = "Origin_str" if "Origin_str" in df.columns else "Origin"
+        dest_col   = "Dest_str"   if "Dest_str"   in df.columns else "Dest"
+
+        dep_col = "CRSDepTime_raw" if "CRSDepTime_raw" in df.columns else "CRSDepTime"
+        arr_col = "CRSArrTime_raw" if "CRSArrTime_raw" in df.columns else "CRSArrTime"
+        keep = [c for c in [origin_col, dest_col, "FlightDate",
+                            dep_col, arr_col] if c in df.columns]
+        inbound_all  = df.loc[df[dest_col] == hub, keep]
+        outbound_all = df.loc[df[origin_col] == hub, keep]
+
+        if len(inbound_all) == 0 or len(outbound_all) == 0:
+            print(f"  WARNING: No inbound or outbound flights to {hub}")
+            return pd.DataFrame()
+
+        dates = sorted(set(inbound_all["FlightDate"].unique()) &
+                       set(outbound_all["FlightDate"].unique()))
+        print(f"  Processing {len(dates):,} days of A→{hub}→B pairs")
+
+        in_grp  = {d: g for d, g in inbound_all.groupby("FlightDate", sort=False)}
+        out_grp = {d: g for d, g in outbound_all.groupby("FlightDate", sort=False)}
+
+        daily_parts = []
+        for i, d in enumerate(dates):
+            inb = in_grp[d]
+            out = out_grp[d]
+
+            inb_a  = (pd.to_numeric(inb[arr_col], errors="coerce") // 100) * 60 + \
+                     (pd.to_numeric(inb[arr_col], errors="coerce") % 100)
+            inb_d  = (pd.to_numeric(inb[dep_col], errors="coerce") // 100) * 60 + \
+                     (pd.to_numeric(inb[dep_col], errors="coerce") % 100)
+            out_d  = (pd.to_numeric(out[dep_col], errors="coerce") // 100) * 60 + \
+                     (pd.to_numeric(out[dep_col], errors="coerce") % 100)
+            out_a  = (pd.to_numeric(out[arr_col], errors="coerce") // 100) * 60 + \
+                     (pd.to_numeric(out[arr_col], errors="coerce") % 100)
+
+            inb_small = pd.DataFrame({
+                "airport_a": inb[origin_col].values,
+                "arr_a_mins": inb_a.values,
+                "dep_a_mins": inb_d.values,
+            }).dropna()
+            out_small = pd.DataFrame({
+                "airport_b": out[dest_col].values,
+                "dep_b_mins": out_d.values,
+                "arr_b_mins": out_a.values,
+            }).dropna()
+
+            inb_small["_k"] = 1
+            out_small["_k"] = 1
+            seq = inb_small.merge(out_small, on="_k").drop(columns="_k")
+
+            seq["dfw_conn_mins"] = seq["dep_b_mins"] - seq["arr_a_mins"]
+            seq = seq[seq["dfw_conn_mins"] > 0]
+            if len(seq) == 0:
+                continue
+
+            duty = seq["arr_b_mins"] - seq["dep_a_mins"]
+            duty = duty.where(duty >= 0, duty + 1440)
+            seq["duty_time_mins"] = duty
+            seq["duty_flag"]     = (duty > self.DUTY_LIMIT_MINS).astype(int)
+            seq["mct_violation"] = (seq["dfw_conn_mins"] < self.MCT_MINUTES).astype(int)
+
+            wstart, wend = self.WOCL_START * 60, self.WOCL_END * 60
+            in_wocl = (
+                seq["dep_a_mins"].between(wstart, wend) |
+                seq["arr_a_mins"].between(wstart, wend) |
+                seq["dep_b_mins"].between(wstart, wend) |
+                seq["arr_b_mins"].between(wstart, wend)
+            )
+            seq["wocl_flag"] = in_wocl.astype(int)
+            seq["wocl_multiplier"] = np.where(in_wocl, self.WOCL_MULTIPLIER, 1.0)
+
+            agg = seq.groupby(["airport_a", "airport_b"], sort=False).agg(
+                duty_flag=("duty_flag", "max"),
+                n_sequences=("dfw_conn_mins", "size"),
+                n_mct_violations=("mct_violation", "sum"),
+                n_wocl=("wocl_flag", "sum"),
+                duty_time_mins=("duty_time_mins", "max"),
+                conn_min_mins=("dfw_conn_mins", "min"),
+                conn_sum_mins=("dfw_conn_mins", "sum"),
+            ).reset_index()
+            daily_parts.append(agg)
+
+            if (i + 1) % 200 == 0:
+                print(f"    processed {i+1:,}/{len(dates):,} days")
+
+        if not daily_parts:
+            return pd.DataFrame()
+
+        all_days = pd.concat(daily_parts, ignore_index=True)
+        final = all_days.groupby(["airport_a", "airport_b"], sort=False).agg(
+            duty_flag=("duty_flag", "max"),
+            n_sequences=("n_sequences", "sum"),
+            n_mct_violations=("n_mct_violations", "sum"),
+            n_wocl=("n_wocl", "sum"),
+            duty_time_mins=("duty_time_mins", "max"),
+            conn_min_mins=("conn_min_mins", "min"),
+            conn_sum_mins=("conn_sum_mins", "sum"),
+        ).reset_index()
+
+        final["n_sequences"] = final["n_sequences"].clip(lower=1)
+        final["mct_violation_rate"] = final["n_mct_violations"] / final["n_sequences"]
+        final["wocl_exposure_rate"] = final["n_wocl"] / final["n_sequences"]
+        final["avg_duty_mins"] = final["duty_time_mins"]
+        final["avg_conn_mins"] = final["conn_sum_mins"] / final["n_sequences"]
+
+        # Feasibility now depends on persistent MCT violations.
+        final["mct_violation"] = (
+            final["mct_violation_rate"] >= self.MCT_INFEASIBLE_RATE
+        ).astype(int)
+        final["wocl_flag"] = (final["wocl_exposure_rate"] > 0).astype(int)
+        final["wocl_multiplier"] = (
+            1.0 + (self.WOCL_MULTIPLIER - 1.0) * final["wocl_exposure_rate"]
+        ).clip(lower=1.0, upper=self.WOCL_MULTIPLIER)
+
+        n = len(final)
+        print(f"\n  Aggregated to {n:,} unique (airport_a, airport_b) pairs")
+        print(f"    Duty flag (>14hr): {int(final['duty_flag'].sum()):,} ({final['duty_flag'].mean()*100:.1f}%)")
+        print(
+            "    MCT infeasible (violation rate "
+            f">= {self.MCT_INFEASIBLE_RATE:.2f}): "
+            f"{int(final['mct_violation'].sum()):,} ({final['mct_violation'].mean()*100:.1f}%)"
+        )
+        print(f"    WOCL exposure: {int(final['wocl_flag'].sum()):,} ({final['wocl_flag'].mean()*100:.1f}%)")
+        return final

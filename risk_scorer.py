@@ -2,13 +2,14 @@
 Airport Pair Risk Scorer — Architecture Layer 4 Output Contract
 
 Properly maps model predictions back to (airport_a, airport_b) pairs.
-Applies proxy features (duty_flag, mct_violation, wocl_multiplier) as
-post-prediction constraints:
-  final_score = ml_risk × wocl_multiplier, zeroed if mct_violation = 1
+Keeps risk and feasibility separate:
+  risk_score   = ml_risk × wocl_multiplier
+  is_feasible  = 1 when mct_violation == 0
+  display_score = risk_score for feasible pairs, NaN otherwise
 
 Output contract:
-  airport_a · airport_b · month · ml_risk_score · wocl_multiplier ·
-  final_score · duty_flag · mct_violation · wocl_flag
+  airport_a · airport_b · ml_risk_score · risk_score · display_score ·
+  is_feasible · wocl_multiplier · duty_flag · mct_violation · wocl_flag
 """
 import torch
 import numpy as np
@@ -48,13 +49,17 @@ class PairRiskScorer:
             preds = output["prediction"].cpu().numpy()
             y_props = output["y_prop"].cpu().numpy()
 
-            origins = batch["origin"]   # list of strings from custom collate
-            dests = batch["dest"]       # list of strings from custom collate
+            origins = batch["origin"]
+            dests = batch["dest"]
+            years = batch.get("year", [0] * len(preds))
+            months = batch.get("month", [0] * len(preds))
 
             for i in range(len(preds)):
                 rows.append({
                     "origin": origins[i],
                     "dest": dests[i],
+                    "year": int(years[i]),
+                    "month": int(months[i]),
                     "pred_delay": float(preds[i]),
                     "actual_delay": float(targets[i]),
                     "propagated_delay": float(y_props[i]),
@@ -122,15 +127,41 @@ class PairRiskScorer:
 
         # Merge proxy features
         if proxy_df is not None and len(proxy_df) > 0:
-            proxy_agg = proxy_df.groupby(["airport_a", "airport_b"]).agg(
-                duty_flag=("duty_flag", "max"),
-                mct_violation=("mct_violation", "max"),
-                wocl_flag=("wocl_flag", "max"),
-                wocl_multiplier=("wocl_multiplier", "max"),
-                avg_duty_mins=("duty_time_mins", "mean"),
-                avg_conn_mins=("dfw_conn_mins", "mean"),
-            ).reset_index()
-            pairs = pairs.merge(proxy_agg, on=["airport_a", "airport_b"], how="left")
+            proxy_named_aggs = {}
+            if "duty_flag" in proxy_df.columns:
+                proxy_named_aggs["duty_flag"] = ("duty_flag", "max")
+            if "mct_violation" in proxy_df.columns:
+                proxy_named_aggs["mct_violation"] = ("mct_violation", "max")
+            if "mct_violation_rate" in proxy_df.columns:
+                proxy_named_aggs["mct_violation_rate"] = ("mct_violation_rate", "mean")
+            if "wocl_flag" in proxy_df.columns:
+                proxy_named_aggs["wocl_flag"] = ("wocl_flag", "max")
+            if "wocl_exposure_rate" in proxy_df.columns:
+                proxy_named_aggs["wocl_exposure_rate"] = ("wocl_exposure_rate", "mean")
+            if "wocl_multiplier" in proxy_df.columns:
+                # With exposure-aware proxies this is already calibrated.
+                proxy_named_aggs["wocl_multiplier"] = ("wocl_multiplier", "mean")
+            if "avg_duty_mins" in proxy_df.columns:
+                proxy_named_aggs["avg_duty_mins"] = ("avg_duty_mins", "mean")
+            elif "duty_time_mins" in proxy_df.columns:
+                proxy_named_aggs["avg_duty_mins"] = ("duty_time_mins", "mean")
+            if "avg_conn_mins" in proxy_df.columns:
+                proxy_named_aggs["avg_conn_mins"] = ("avg_conn_mins", "mean")
+            elif "dfw_conn_mins" in proxy_df.columns:
+                proxy_named_aggs["avg_conn_mins"] = ("dfw_conn_mins", "mean")
+            if "n_sequences" in proxy_df.columns:
+                proxy_named_aggs["n_sequences"] = ("n_sequences", "sum")
+
+            if proxy_named_aggs:
+                proxy_agg = proxy_df.groupby(
+                    ["airport_a", "airport_b"]
+                ).agg(**proxy_named_aggs).reset_index()
+                pairs = pairs.merge(proxy_agg, on=["airport_a", "airport_b"], how="left")
+            else:
+                pairs["duty_flag"] = 0
+                pairs["mct_violation"] = 0
+                pairs["wocl_flag"] = 0
+                pairs["wocl_multiplier"] = 1.0
         else:
             pairs["duty_flag"] = 0
             pairs["mct_violation"] = 0
@@ -139,17 +170,34 @@ class PairRiskScorer:
 
         pairs["duty_flag"] = pairs["duty_flag"].fillna(0).astype(int)
         pairs["mct_violation"] = pairs["mct_violation"].fillna(0).astype(int)
+        pairs["mct_violation_rate"] = pairs.get("mct_violation_rate", pairs["mct_violation"]).fillna(0.0)
         pairs["wocl_flag"] = pairs["wocl_flag"].fillna(0).astype(int)
+        pairs["wocl_exposure_rate"] = pairs.get("wocl_exposure_rate", pairs["wocl_flag"]).fillna(0.0)
         pairs["wocl_multiplier"] = pairs["wocl_multiplier"].fillna(1.0)
+        pairs["mct_violation_rate"] = pairs["mct_violation_rate"].clip(lower=0, upper=1)
+        pairs["wocl_exposure_rate"] = pairs["wocl_exposure_rate"].clip(lower=0, upper=1)
 
-        # final_score = ml_risk × wocl_multiplier, zeroed if mct_violation
-        pairs["final_score"] = (
-            pairs["ml_risk_score"] *
-            pairs["wocl_multiplier"] *
-            (1 - pairs["mct_violation"])
+        # Keep risk semantics explicit:
+        #   risk_score   = continuous risk signal (no feasibility gate)
+        #   is_feasible  = 1 when no MCT violation
+        #   display_score = risk shown to users; infeasible pairs masked as NaN
+        pairs["risk_score"] = (
+            pairs["ml_risk_score"] * pairs["wocl_multiplier"]
         ).round(4)
+        pairs["is_feasible"] = (pairs["mct_violation"] == 0).astype(int)
+        pairs["display_score"] = pairs["risk_score"].where(
+            pairs["is_feasible"] == 1, np.nan
+        )
 
-        return pairs.sort_values("final_score", ascending=False)
+        # Backward-compatibility alias for downstream consumers that still
+        # expect "final_score" in exports.
+        pairs["final_score"] = pairs["display_score"]
+
+        return pairs.sort_values(
+            by=["is_feasible", "display_score", "risk_score"],
+            ascending=[False, False, False],
+            na_position="last",
+        )
 
     def export(self, pairs: pd.DataFrame, output_dir: str = "./results") -> pd.DataFrame:
         """Export scored pairs matching the PostgreSQL output contract."""
@@ -157,8 +205,10 @@ class PairRiskScorer:
         output_dir.mkdir(exist_ok=True)
 
         contract_cols = [
-            "airport_a", "airport_b", "ml_risk_score", "wocl_multiplier",
-            "final_score", "duty_flag", "mct_violation", "wocl_flag",
+            "airport_a", "airport_b", "ml_risk_score", "risk_score",
+            "display_score", "is_feasible", "wocl_multiplier",
+            "final_score", "duty_flag", "mct_violation", "mct_violation_rate",
+            "wocl_flag", "wocl_exposure_rate", "n_sequences", "avg_conn_mins",
         ]
         available = [c for c in contract_cols if c in pairs.columns]
         scored = pairs[available].copy()
@@ -166,13 +216,15 @@ class PairRiskScorer:
         pairs.to_csv(output_dir / "pair_risk_scores_full.csv", index=False)
         scored.to_csv(output_dir / "scored_pairs.csv", index=False)
 
-        flagged = pairs[pairs["final_score"] >= 0.6].copy()
+        flagged = pairs[(pairs["is_feasible"] == 1) & (pairs["risk_score"] >= 0.6)].copy()
         flagged["recommendation"] = "AVOID"
-        flagged.loc[flagged["final_score"] >= 0.8, "recommendation"] = "CRITICAL"
+        flagged.loc[flagged["risk_score"] >= 0.8, "recommendation"] = "CRITICAL"
 
-        flag_cols = [c for c in ["airport_a", "airport_b", "final_score",
-                     "recommendation", "ml_risk_score", "duty_flag",
-                     "mct_violation", "wocl_flag"] if c in flagged.columns]
+        flag_cols = [c for c in ["airport_a", "airport_b", "risk_score",
+                     "display_score", "recommendation", "ml_risk_score", "duty_flag",
+                     "mct_violation", "mct_violation_rate",
+                     "wocl_flag", "wocl_exposure_rate",
+                     "avg_conn_mins", "n_sequences"] if c in flagged.columns]
         flagged[flag_cols].to_csv(output_dir / "flagged_pairs.csv", index=False)
 
         print(f"\n  scored_pairs.csv — {len(scored):,} pairs")

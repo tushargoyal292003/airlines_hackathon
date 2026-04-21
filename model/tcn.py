@@ -28,14 +28,21 @@ class CausalConv1d(nn.Module):
 
 
 class TCNBlock(nn.Module):
-    """Single TCN residual block with dilated causal convolutions."""
+    """Single TCN residual block with dilated causal convolutions.
+
+    FIX: BatchNorm1d replaced with LayerNorm.
+    BatchNorm1d normalises across (batch, seq_len) per channel — zero-padded
+    positions contaminate the running statistics and bias all activations.
+    LayerNorm normalises per (position, channel) independently, so padded
+    positions only affect themselves.
+    """
 
     def __init__(self, in_channels, out_channels, kernel_size, dilation, dropout):
         super().__init__()
         self.conv1 = CausalConv1d(in_channels, out_channels, kernel_size, dilation)
         self.conv2 = CausalConv1d(out_channels, out_channels, kernel_size, dilation)
-        self.bn1 = nn.BatchNorm1d(out_channels)
-        self.bn2 = nn.BatchNorm1d(out_channels)
+        self.ln1 = nn.LayerNorm(out_channels)
+        self.ln2 = nn.LayerNorm(out_channels)
         self.relu = nn.ReLU()
         self.dropout = nn.Dropout(dropout)
 
@@ -46,9 +53,13 @@ class TCNBlock(nn.Module):
         )
 
     def forward(self, x):
+        # x: (batch, channels, seq_len)
         residual = self.downsample(x)
-        out = self.dropout(self.relu(self.bn1(self.conv1(x))))
-        out = self.dropout(self.relu(self.bn2(self.conv2(out))))
+        # LayerNorm expects (..., channels) — transpose, norm, transpose back
+        out = self.conv1(x).transpose(1, 2)          # (B, seq_len, C)
+        out = self.dropout(self.relu(self.ln1(out))).transpose(1, 2)  # (B, C, seq_len)
+        out = self.conv2(out).transpose(1, 2)
+        out = self.dropout(self.relu(self.ln2(out))).transpose(1, 2)
         return self.relu(out + residual)
 
 
